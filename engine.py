@@ -11,14 +11,14 @@ class Hooks:
         card_used: Callable,
         round_over: Callable,
         game_over: Callable,
-        game_forfeited: Callable, 
+        new_round: Callable,
         request_deny: Callable,
     ):
         self.game_start = game_start
         self.card_used = card_used
         self.round_over = round_over
         self.game_over = game_over
-        self.game_forfeited = game_forfeited
+        self.new_round = new_round
         self.request_deny = request_deny
         
 
@@ -35,10 +35,6 @@ class Card:
 
         return {
             'A': 11,
-            '2': 2,
-            '3': 3,
-            '4': 4,
-            '5': 5,
             '6': 6,
             '7': 7,
             '8': 8,
@@ -91,10 +87,10 @@ class Game:
         Represents an ongoing game.
         '''
         self.hooks: Hooks = hooks
-        self.id: int = players[0]
+        self.id: int = players[0][0]
 
         self.players: Dict[int, Player] = {
-            i: Player(*i) for i in players
+            i[0]: Player(*i) for i in players
         }
         self.ready = False
         self.waiting = False
@@ -103,8 +99,11 @@ class Game:
 
         self.turn: int = None
         self.loser: int = None
+        self.loser_earned: str = ''
+        self.winner_subbed: str = ''
         self.deck: List[Card] = []
-        self.stack: Card = []
+        self.stack: Card = None
+        self.took = False
 
         self.chat: int = chat
         self.message: int = message
@@ -114,7 +113,7 @@ class Game:
         '''
         Adds a card to a player from the top of the deck.
         '''
-        if len(self.deck) < 0:
+        if len(self.deck) > 0:
             self.players[id].cards.append(self.deck.pop(0))
 
 
@@ -139,7 +138,8 @@ class Game:
         Adds necessary cards to each player.
         '''
         for i in self.players.values():
-            while len(i.cards) < 4:
+            amount = 4 - len(i.cards)
+            for _ in range(amount):
                 self.add_card(i.id)
 
 
@@ -180,11 +180,16 @@ class Game:
         '''
         # stuff
         self.round += 1
+        self.waiting = False
+        self.type_chooser = False
+        self.stack = None
 
         # shuffling deck
         self.shuffle_deck()
         self.redistribute_cards()
         self.choose_next()
+
+        await self.hooks.new_round(self.id)
 
 
     async def round_end(self):
@@ -194,16 +199,26 @@ class Game:
         self.waiting = True
         
         # points
-        id = self.get_other_player(self.loser)
-        player = self.players[id]
+        player = self.players[self.loser]
 
         player.pts += sum([i.cost for i in player.cards])
+        self.loser_earned = ''
+
+        for i in player.cards:
+            self.loser_earned += f' {str(i)} - <code>{i.cost}</code>\n'
+        self.loser_earned += f'<code>+ {sum([i.cost for i in player.cards])}</code>'
 
         # removing cards
         for i in self.players.values():
             i.cards = []
 
-        await self.hooks.round_end(self.id)
+        # checking for game end
+        for i in self.players.values():
+            if i.pts >= 105:
+                await self.hooks.game_over(self.id)
+                return
+
+        await self.hooks.round_over(self.id)
 
 
     async def check_end(self):
@@ -216,23 +231,30 @@ class Game:
                 await self.round_end()
                 return
             
-        self.hooks.card_used(self.id)
+        await self.hooks.card_used(self.id)
 
 
-    async def use_card(self, id: int, card: Card) -> bool:
+    async def use_card(self, id: int, index: int) -> bool:
         '''
         Uses a card.
         '''
         if id != self.turn:
             return False
         
+        card = self.players[id].cards[index]
+        
         # checking if the card is hittable
-        if card.is_hittable_on(self.stack):
+        if self.stack == None or card.is_hittable_on(self.stack):
             self.stack = card
             self.players[id].cards.remove(card)
-            self.turn = self.get_other_player(id)
 
-        if card.value in ["6", "7", "Q", "A"]:
+        else:
+            return False
+        
+        self.took = False
+
+        if card.value not in ["6", "7", "Q", "A"]:
+            self.turn = self.get_other_player(id)
             await self.check_end()
             return True
         
@@ -247,6 +269,46 @@ class Game:
 
         await self.check_end()
         return True
+
+
+    async def queen_end(self, id: int) -> bool:
+        '''
+        Ends the game with all queens.
+        '''
+        if id != self.turn:
+            return False
+
+        if not self.players[id].is_queen_winnable:
+            return
+        
+        amount = sum([i.cost for i in self.players[id].cards])
+        self.winner_subbed = f'\n\n<b>{self.players[id].mention} списал дамами!</b>\n'\
+            f'{" ".join([i.type for i in self.players[id].cards])} = <code>-{amount}</code>'
+
+        self.players[id].pts -= amount
+        self.players[id].cards = []
+
+        await self.check_end()
+        return True
+
+
+    async def take_card(self, id: int) -> bool:
+        '''
+        Takes a card.
+        '''
+        if id != self.turn:
+            return False
+        
+        # taking card
+        if not self.took:
+            self.add_card(id)
+            self.took = True
+        else:
+            self.turn = self.get_other_player(id)
+            self.took = False
+
+        await self.check_end()
+        return True
     
 
     async def answer_type_chooser(self, id: int, type: str) -> bool:
@@ -257,6 +319,10 @@ class Game:
             return False
 
         self.stack.type = type
+        self.type_chooser = False
+        self.turn = self.get_other_player(id)
+        
+        await self.check_end()
         return True
     
 
@@ -264,15 +330,21 @@ class Game:
         '''
         Returns the string to show in the message.
         '''
+        if self.waiting:
+            return f'<b>конец раунда {self.round}</b>\n\n{self.players[self.loser].mention} проиграл!'\
+                f'\n\n{self.loser_earned}\n\nслед. раунд через 10 секунд'
+        
+        if self.type_chooser:
+            return f'{self.players[self.turn].mention}, выбери масть!'
+
         players = ''
         for i in self.players.values():
             emoji = '<code>   </code>' if i.id != self.turn else '👉 '
             players += f'{emoji}{i.mention}\n'\
                 f'<code>   </code>📊 <code>{i.pts}</code>  -  🃏 <code>{len(i.cards)}</code>\n\n'
         
-        string = f'<b>раунд {self.round}</b>\n\n'\
-            +players+\
-            +f'карта: {str(self.stack)}\n\n'\
+        string = players+f'карт в колоде: <code>{len(self.deck)}</code>\n'+\
+            (f'карта: {str(self.stack)}' if self.stack != None else '')\
 
         return string
 
@@ -286,6 +358,17 @@ class Manager:
         '''
         self.games: Dict[int, Game] = {}
         self.hooks: Hooks = None
+        self.rules: str = ''
+
+        self.load_data()
+
+
+    def load_data(self):
+        '''
+        Loads rules from a file.
+        '''
+        with open('rules.html', 'r', encoding='utf-8') as f:
+            self.rules = f.read()
 
 
     def get_game_playing(self, id: int) -> Game:
@@ -316,7 +399,7 @@ class Manager:
         '''
         Creates a new game.
         '''
-        id = players[0]
+        id = players[0][0]
 
         game = Game(
             self.hooks,
@@ -336,6 +419,6 @@ class Manager:
         '''
         if id not in self.games: return False
 
-        self.games.pop(id)
+        await self.games[id].hooks.game_over(id)
 
         return True
