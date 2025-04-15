@@ -37,10 +37,14 @@ async def game_start(id: int):
     game = mg.get_game(id)
     if game == None: return
 
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(types.InlineKeyboardButton(text='выбрать карту...', switch_inline_query_current_chat=''))
+
     await bot.edit_message_text(
         text = 'игра началась!',
         chat_id = game.chat,
-        message_id = game.message
+        message_id = game.message, 
+        reply_markup = keyboard.as_markup()
     )
 
 
@@ -189,7 +193,13 @@ async def invite(msg: types.Message):
         callback_data=f'deny:{player1}:{player2}'
     ))
         
-    message = await msg.reply('бум', reply_markup=keyboard.as_markup())
+    user = msg.reply_to_message.from_user
+    mention = f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
+    message = await msg.reply(
+        f'{mention}, тебя приглашают в игру в шульпека!\n\n'\
+        'прочитай правила, если не знаешь как играть - <b>/rules</b>',
+        reply_markup=keyboard.as_markup()
+    )
     mg.new_game(
         [(player1, msg.from_user.full_name), (player2, msg.reply_to_message.from_user.full_name)],
         msg.chat.id, message.message_id
@@ -363,7 +373,7 @@ async def inline(q: types.InlineQuery):
     
     # not your turn
     if q.from_user.id != game.turn:
-        await q.answer([
+        items = [
             types.InlineQueryResultArticle(
                 id='cancel',
                 title='сейчас не твой ход!',
@@ -372,10 +382,20 @@ async def inline(q: types.InlineQuery):
                     message_text='я слился'
                 )
             )
-        ], cache_time=1, is_personal=True)
+        ]
+        cards_list = game.players[q.from_user.id].cards
+        cards = ' ・ '.join([str(i) for i in cards_list])
+        items.append(types.InlineQueryResultArticle(
+            id=f'discard',
+            title=f'твои карты ({len(cards_list)})',
+            description=cards,
+            input_message_content=types.InputTextMessageContent(
+                message_text=f'привет!'
+            )
+        ))
+
+        await q.answer(items, cache_time=1, is_personal=True)
         return
-    
-    print(q.from_user.id, game.turn)
     
     # card picker
     if game.type_chooser:
@@ -389,6 +409,17 @@ async def inline(q: types.InlineQuery):
                     message_text=f'{i} {config.NAMES[i]}'
                 )
             ))
+
+        cards_list = game.players[q.from_user.id].cards
+        cards = ' ・ '.join([str(i) for i in cards_list])
+        items.append(types.InlineQueryResultArticle(
+            id=f'discard',
+            title=f'твои карты ({len(cards_list)})',
+            description=cards,
+            input_message_content=types.InputTextMessageContent(
+                message_text=f'привет!'
+            )
+        ))
 
         await q.answer(items, cache_time=1, is_personal=True)
         return
